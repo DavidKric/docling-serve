@@ -34,6 +34,7 @@ dependencies = [
     "mlx-vlm~=0.1.12; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "fastapi[standard]~=0.115",
     "httpx~=0.28",
+    "kfp[kubernetes]>=2.10.0",
     "pydantic~=2.10",
     "pydantic-settings~=2.4",
     "python-multipart>=0.0.14,<0.1.0",
@@ -81,6 +82,10 @@ conflicts = [
     { extra = "cpu" },
     { extra = "cu124" },
   ],
+]
+environments = ["sys_platform != 'darwin' or platform_machine != 'x86_64'"]
+override-dependencies = [
+  "urllib3~=2.0"
 ]
 
 [tool.uv.sources]
@@ -197,6 +202,8 @@ module = [
     "tesserocr.*",
     "rapidocr_onnxruntime.*",
     "requests.*",
+    "kfp.*",
+    "kfp_server_api.*",
     "mlx_vlm.*",
 ]
 ignore_missing_imports = true
