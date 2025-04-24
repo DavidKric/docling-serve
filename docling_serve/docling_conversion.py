@@ -21,6 +21,8 @@ from docling.datamodel.pipeline_options import (
     PdfBackend,
     PdfPipeline,
     PdfPipelineOptions,
+    PictureDescriptionApiOptions,
+    PictureDescriptionVlmOptions,
     TableFormerMode,
     VlmPipelineOptions,
     smoldocling_vlm_conversion_options,
@@ -116,6 +118,7 @@ def _parse_standard_pdf_opts(
 
     pipeline_options = PdfPipelineOptions(
         artifacts_path=artifacts_path,
+        enable_remote_services=docling_serve_settings.enable_remote_services,
         document_timeout=request.document_timeout,
         do_ocr=request.do_ocr,
         ocr_options=ocr_options,
@@ -131,6 +134,20 @@ def _parse_standard_pdf_opts(
         pipeline_options.generate_page_images = True
         if request.images_scale:
             pipeline_options.images_scale = request.images_scale
+
+    if request.picture_description_local is not None:
+        pipeline_options.picture_description_options = (
+            PictureDescriptionVlmOptions.model_validate(
+                request.picture_description_local.model_dump()
+            )
+        )
+
+    if request.picture_description_api is not None:
+        pipeline_options.picture_description_options = (
+            PictureDescriptionApiOptions.model_validate(
+                request.picture_description_api.model_dump()
+            )
+        )
 
     return pipeline_options
 
