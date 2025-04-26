@@ -2,8 +2,24 @@ import re
 from docling.datamodel.document import DoclingDocument, DocItemLabel, BoundingBox
 from typing import List, Dict
 from .schemas import Box,Span
+import uuid
 
 class SemanticDocumentAugmentationExportService:
+
+    # Store documents in memory for testing purposes
+    _document_store: dict[str, DoclingDocument] = {}
+
+    @classmethod
+    def register_document(cls, doc: DoclingDocument) -> str:
+        doc_id = str(uuid.uuid4())
+        cls._document_store[doc_id] = doc
+        return doc_id
+
+    @classmethod
+    def get_document(cls, doc_id: str) -> DoclingDocument | None:
+        return cls._document_store.get(doc_id)
+
+    # Extract paragraphs from the document
     @staticmethod
     def extract_paragraphs(doc: DoclingDocument) -> List[dict]:
         paragraphs = []
@@ -24,6 +40,7 @@ class SemanticDocumentAugmentationExportService:
                 paragraphs.append({"text": para_text, "boxes": [box_coords]})
         return paragraphs
 
+    # Helper function to get the page number of an item
     @staticmethod
     def _get_page_number(item, doc: DoclingDocument) -> int:
         """Traverse parents to find the page number of this item."""
@@ -35,6 +52,7 @@ class SemanticDocumentAugmentationExportService:
         # Fallback: if not found via parent, maybe the item itself has page_no
         return getattr(item, "page_no", 1)
 
+    # Extract sentences from the document
     @staticmethod
     def extract_sentences(doc: DoclingDocument) -> List[dict]:
         sentences = []
@@ -61,6 +79,7 @@ class SemanticDocumentAugmentationExportService:
                 sentences.append({"text": last_text, "boxes": [sentence_box]})
         return sentences
     
+    # Extract tokens from the document
     @staticmethod
     def extract_tokens(doc: DoclingDocument) -> List[dict]:
         tokens = []
@@ -78,6 +97,7 @@ class SemanticDocumentAugmentationExportService:
                 tokens.append({"text": token_text, "boxes": [token_box]})
         return tokens  
 
+    # Extract sections from the document
     @staticmethod
     def extract_sections(doc: DoclingDocument) -> List[dict]:
         sections = []
@@ -91,6 +111,7 @@ class SemanticDocumentAugmentationExportService:
                 sections.append({"text": sec_text, "boxes": [section_box]})
         return sections
 
+    # Extract titles from the document
     @staticmethod
     def extract_title(doc: DoclingDocument) -> List[dict]:
         titles = []
@@ -105,6 +126,7 @@ class SemanticDocumentAugmentationExportService:
                 break  # assume only one title
         return titles
 
+    # Extract authors from the document
     @staticmethod
     def extract_authors(doc: DoclingDocument) -> List[dict]:
         authors = []
@@ -127,6 +149,7 @@ class SemanticDocumentAugmentationExportService:
                         authors.append({"text": author_text, "boxes": [author_box]})
         return authors
 
+    # Extract tables from the document
     @staticmethod
     def extract_tables(doc: DoclingDocument) -> List[dict]:
         tables = []
@@ -160,6 +183,7 @@ class SemanticDocumentAugmentationExportService:
             tables.append(entity)
         return tables
 
+    # Extract figures from the document
     @staticmethod
     def extract_figures(doc: DoclingDocument) -> List[dict]:
         figures = []
@@ -185,6 +209,7 @@ class SemanticDocumentAugmentationExportService:
             figures.append(entity)
         return figures
 
+    # Extract captions from the document
     @staticmethod
     def extract_captions(doc: DoclingDocument) -> List[dict]:
         captions = []
@@ -197,7 +222,8 @@ class SemanticDocumentAugmentationExportService:
                 cap_box = Box(page=page_no, x1=bbox_tl.l, y1=bbox_tl.t, x2=bbox_tl.r, y2=bbox_tl.b)
                 captions.append({"text": cap_text, "boxes": [cap_box]})
         return captions
-    
+
+    # Extract footnotes from the document
     @staticmethod
     def extract_footnotes(doc: DoclingDocument) -> List[dict]:
         footnotes = []
@@ -210,7 +236,8 @@ class SemanticDocumentAugmentationExportService:
                 fn_box = Box(page=page_no, x1=bbox_tl.l, y1=bbox_tl.t, x2=bbox_tl.r, y2=bbox_tl.b)
                 footnotes.append({"text": fn_text, "boxes": [fn_box]})
         return footnotes
-    
+
+    # Extract headers from the document
     @staticmethod
     def extract_headers(doc: DoclingDocument) -> List[dict]:
         headers = []
@@ -224,6 +251,7 @@ class SemanticDocumentAugmentationExportService:
                 headers.append({"text": hd_text, "boxes": [hd_box]})
         return headers
 
+    # Extract footers from the document
     @staticmethod
     def extract_footers(doc: DoclingDocument) -> List[dict]:
         footers = []
@@ -236,7 +264,8 @@ class SemanticDocumentAugmentationExportService:
                 ft_box = Box(page=page_no, x1=bbox_tl.l, y1=bbox_tl.t, x2=bbox_tl.r, y2=bbox_tl.b)
                 footers.append({"text": ft_text, "boxes": [ft_box]})
         return footers
-    
+
+    # Extract lists from the document
     @staticmethod
     def extract_lists(doc: DoclingDocument) -> List[dict]:
         lists = []
@@ -267,7 +296,8 @@ class SemanticDocumentAugmentationExportService:
                 entity = {"text": list_text, "boxes": [list_box] if list_box else []}
                 lists.append(entity)
         return lists
-    
+
+    # Extract algorithms from the document
     @staticmethod
     def extract_algorithms(doc: DoclingDocument) -> List[dict]:
         algorithms = []
@@ -307,6 +337,7 @@ class SemanticDocumentAugmentationExportService:
             algorithms.append({"text": combined_text, "boxes": [algo_box]})
         return algorithms
 
+    # Extract equations from the document
     @staticmethod
     def extract_equations(doc: DoclingDocument) -> List[dict]:
         equations = []
@@ -320,6 +351,7 @@ class SemanticDocumentAugmentationExportService:
                 equations.append({"text": eq_text, "boxes": [eq_box]})
         return equations
 
+    # Extract references from the document
     @staticmethod
     def extract_references(doc: DoclingDocument) -> List[dict]:
         references = []
@@ -333,6 +365,7 @@ class SemanticDocumentAugmentationExportService:
                 references.append({"text": ref_text, "boxes": [ref_box]})
         return references
 
+    # Export the entire document in Papermage-style JSON structure, with symbols and layered entities.
     @staticmethod
     def export_document(doc: DoclingDocument) -> dict:
         """

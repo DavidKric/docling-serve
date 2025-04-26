@@ -1,1 +1,0 @@
-from .routes import router as papermage_router

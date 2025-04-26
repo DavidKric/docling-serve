@@ -6,6 +6,7 @@ import time
 from contextlib import asynccontextmanager
 from io import BytesIO
 from typing import Annotated
+from docling_serve.app import semantic_document_augmentation_router
 
 from fastapi import (
     BackgroundTasks,
@@ -143,7 +144,7 @@ def create_app():  # noqa: C901
         lifespan=lifespan,
         version=version,
     )
-
+    app.include_router(semantic_document_augmentation_router, prefix="/semantic-document-augmentation")
     origins = docling_serve_settings.cors_origins
     methods = docling_serve_settings.cors_methods
     headers = docling_serve_settings.cors_headers

@@ -1,0 +1,1 @@
+from .routes import router as semantic_document_augmentation_router
