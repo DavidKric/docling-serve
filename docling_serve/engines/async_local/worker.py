@@ -1,17 +1,18 @@
 import asyncio
 import logging
+import shutil
 import time
 from typing import TYPE_CHECKING, Any, Optional, Union
 
-from fastapi import BackgroundTasks
+from fastapi.responses import FileResponse
 
 from docling.datamodel.base_models import DocumentStream
 
 from docling_serve.datamodel.engines import TaskStatus
-from docling_serve.datamodel.requests import ConvertDocumentFileSourcesRequest
-from docling_serve.datamodel.responses import ConvertDocumentResponse
+from docling_serve.datamodel.requests import FileSource, HttpSource
 from docling_serve.docling_conversion import convert_documents
 from docling_serve.response_preparation import process_results
+from docling_serve.storage import get_scratch
 
 if TYPE_CHECKING:
     from docling_serve.engines.async_local.orchestrator import AsyncLocalOrchestrator
@@ -44,59 +45,66 @@ class AsyncLocalWorker:
                 # Notify clients about queue updates
                 await self.orchestrator.notify_queue_positions()
 
-                # Get the current event loop
-                asyncio.get_event_loop()
-
                 # Define a callback function to send progress updates to the client.
                 # TODO: send partial updates, e.g. when a document in the batch is done
                 def run_conversion():
-                    sources: list[Union[str, DocumentStream]] = []
+                    convert_sources: list[Union[str, DocumentStream]] = []
                     headers: Optional[dict[str, Any]] = None
-                    if isinstance(task.request, ConvertDocumentFileSourcesRequest):
-                        for file_source in task.request.file_sources:
-                            sources.append(file_source.to_document_stream())
-                    else:
-                        for http_source in task.request.http_sources:
-                            sources.append(http_source.url)
-                            if headers is None and http_source.headers:
-                                headers = http_source.headers
+                    for source in task.sources:
+                        if isinstance(source, DocumentStream):
+                            convert_sources.append(source)
+                        elif isinstance(source, FileSource):
+                            convert_sources.append(source.to_document_stream())
+                        elif isinstance(source, HttpSource):
+                            convert_sources.append(str(source.url))
+                            if headers is None and source.headers:
+                                headers = source.headers
 
                     # Note: results are only an iterator->lazy evaluation
                     results = convert_documents(
-                        sources=sources,
-                        options=task.request.options,
+                        sources=convert_sources,
+                        options=task.options,
                         headers=headers,
                     )
 
                     # The real processing will happen here
+                    work_dir = get_scratch() / task_id
                     response = process_results(
-                        background_tasks=BackgroundTasks(),
-                        conversion_options=task.request.options,
+                        conversion_options=task.options,
                         conv_results=results,
+                        work_dir=work_dir,
                     )
+
+                    if work_dir.exists():
+                        task.scratch_dir = work_dir
+                        if not isinstance(response, FileResponse):
+                            _log.warning(
+                                f"Task {task_id=} produced content in {work_dir=} but the response is not a file."
+                            )
+                            shutil.rmtree(work_dir, ignore_errors=True)
 
                     return response
 
-                # Run the prediction in a thread to avoid blocking the event loop.
                 start_time = time.monotonic()
+
+                # Run the prediction in a thread to avoid blocking the event loop.
+                # Get the current event loop
+                # loop = asyncio.get_event_loop()
                 # future = asyncio.run_coroutine_threadsafe(
                 #     run_conversion(),
                 #     loop=loop
                 # )
                 # response = future.result()
 
+                # Run in a thread
                 response = await asyncio.to_thread(
                     run_conversion,
                 )
                 processing_time = time.monotonic() - start_time
 
-                if not isinstance(response, ConvertDocumentResponse):
-                    _log.error(
-                        f"Worker {self.worker_id} got un-processable "
-                        "result for {task_id}: {type(response)}"
-                    )
                 task.result = response
-                task.request = None
+                task.sources = []
+                task.options = None
 
                 task.task_status = TaskStatus.SUCCESS
                 _log.info(

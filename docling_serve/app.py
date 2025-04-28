@@ -1,11 +1,11 @@
 import asyncio
 import importlib.metadata
 import logging
-import tempfile
+import shutil
+import time
 from contextlib import asynccontextmanager
 from io import BytesIO
-from pathlib import Path
-from typing import Annotated, Any, Optional, Union
+from typing import Annotated
 
 from fastapi import (
     BackgroundTasks,
@@ -35,6 +35,7 @@ from docling_serve.datamodel.callback import (
 from docling_serve.datamodel.convert import ConvertDocumentsOptions
 from docling_serve.datamodel.requests import (
     ConvertDocumentFileSourcesRequest,
+    ConvertDocumentHttpSourcesRequest,
     ConvertDocumentsRequest,
 )
 from docling_serve.datamodel.responses import (
@@ -44,11 +45,7 @@ from docling_serve.datamodel.responses import (
     TaskStatusResponse,
     WebsocketMessage,
 )
-from docling_serve.docling_conversion import (
-    convert_documents,
-    get_converter,
-    get_pdf_pipeline_opts,
-)
+from docling_serve.datamodel.task import Task, TaskSource
 from docling_serve.engines.async_orchestrator import (
     BaseAsyncOrchestrator,
     ProgressInvalid,
@@ -56,8 +53,8 @@ from docling_serve.engines.async_orchestrator import (
 from docling_serve.engines.async_orchestrator_factory import get_async_orchestrator
 from docling_serve.engines.base_orchestrator import TaskNotFoundError
 from docling_serve.helper_functions import FormDepends
-from docling_serve.response_preparation import process_results
 from docling_serve.settings import docling_serve_settings
+from docling_serve.storage import get_scratch
 
 
 # Set up custom logging as we'll be intermixes with FastAPI/Uvicorn's logging
@@ -95,11 +92,11 @@ _log = logging.getLogger(__name__)
 # Context manager to initialize and clean up the lifespan of the FastAPI app
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Converter with default options
-    pdf_format_option = get_pdf_pipeline_opts(ConvertDocumentsOptions())
-    get_converter(pdf_format_option)
-
     orchestrator = get_async_orchestrator()
+    scratch_dir = get_scratch()
+
+    # Warm up processing cache
+    await orchestrator.warm_up_caches()
 
     # Start the background queue processor
     queue_task = asyncio.create_task(orchestrator.process_queue())
@@ -112,6 +109,10 @@ async def lifespan(app: FastAPI):
         await queue_task
     except asyncio.CancelledError:
         _log.info("Queue processor cancelled.")
+
+    # Remove scratch directory in case it was a tempfile
+    if docling_serve_settings.scratch_path is not None:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
 
 
 ##################################
@@ -162,7 +163,8 @@ def create_app():  # noqa: C901
 
             from docling_serve.gradio_ui import ui as gradio_ui
 
-            tmp_output_dir = Path(tempfile.mkdtemp())
+            tmp_output_dir = get_scratch() / "gradio"
+            tmp_output_dir.mkdir(exist_ok=True, parents=True)
             gradio_ui.gradio_output_dir = tmp_output_dir
             app = gr.mount_gradio_app(
                 app,
@@ -210,6 +212,56 @@ def create_app():  # noqa: C901
                 redoc_js_url="/static/redoc.standalone.js",
             )
 
+    ########################
+    # Async / Sync helpers #
+    ########################
+
+    async def _enque_source(
+        orchestrator: BaseAsyncOrchestrator, conversion_request: ConvertDocumentsRequest
+    ) -> Task:
+        sources: list[TaskSource] = []
+        if isinstance(conversion_request, ConvertDocumentFileSourcesRequest):
+            sources.extend(conversion_request.file_sources)
+        if isinstance(conversion_request, ConvertDocumentHttpSourcesRequest):
+            sources.extend(conversion_request.http_sources)
+
+        task = await orchestrator.enqueue(
+            sources=sources, options=conversion_request.options
+        )
+        return task
+
+    async def _enque_file(
+        orchestrator: BaseAsyncOrchestrator,
+        files: list[UploadFile],
+        options: ConvertDocumentsOptions,
+    ) -> Task:
+        _log.info(f"Received {len(files)} files for processing.")
+
+        # Load the uploaded files to Docling DocumentStream
+        file_sources: list[TaskSource] = []
+        for i, file in enumerate(files):
+            buf = BytesIO(file.file.read())
+            suffix = "" if len(file_sources) == 1 else f"_{i}"
+            name = file.filename if file.filename else f"file{suffix}.pdf"
+            file_sources.append(DocumentStream(name=name, stream=buf))
+
+        task = await orchestrator.enqueue(sources=file_sources, options=options)
+        return task
+
+    async def _wait_task_complete(
+        orchestrator: BaseAsyncOrchestrator, task_id: str
+    ) -> bool:
+        MAX_WAIT = 120
+        start_time = time.monotonic()
+        while True:
+            task = await orchestrator.task_status(task_id=task_id)
+            if task.is_completed():
+                return True
+            await asyncio.sleep(5)
+            elapsed_time = time.monotonic() - start_time
+            if elapsed_time > MAX_WAIT:
+                return False
+
     #############################
     # API Endpoints definitions #
     #############################
@@ -243,33 +295,33 @@ def create_app():  # noqa: C901
             }
         },
     )
-    def process_url(
-        background_tasks: BackgroundTasks, conversion_request: ConvertDocumentsRequest
+    async def process_url(
+        background_tasks: BackgroundTasks,
+        orchestrator: Annotated[BaseAsyncOrchestrator, Depends(get_async_orchestrator)],
+        conversion_request: ConvertDocumentsRequest,
     ):
-        sources: list[Union[str, DocumentStream]] = []
-        headers: Optional[dict[str, Any]] = None
-        if isinstance(conversion_request, ConvertDocumentFileSourcesRequest):
-            for file_source in conversion_request.file_sources:
-                sources.append(file_source.to_document_stream())
-        else:
-            for http_source in conversion_request.http_sources:
-                sources.append(http_source.url)
-                if headers is None and http_source.headers:
-                    headers = http_source.headers
-
-        # Note: results are only an iterator->lazy evaluation
-        results = convert_documents(
-            sources=sources, options=conversion_request.options, headers=headers
+        task = await _enque_source(
+            orchestrator=orchestrator, conversion_request=conversion_request
+        )
+        success = await _wait_task_complete(
+            orchestrator=orchestrator, task_id=task.task_id
         )
 
-        # The real processing will happen here
-        response = process_results(
-            background_tasks=background_tasks,
-            conversion_options=conversion_request.options,
-            conv_results=results,
-        )
+        if not success:
+            # TODO: abort task!
+            return HTTPException(
+                status_code=504, detail="Conversion is taking too long."
+            )
 
-        return response
+        result = await orchestrator.task_result(
+            task_id=task.task_id, background_tasks=background_tasks
+        )
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Task result not found. Please wait for a completion status.",
+            )
+        return result
 
     # Convert a document from file(s)
     @app.post(
@@ -283,29 +335,34 @@ def create_app():  # noqa: C901
     )
     async def process_file(
         background_tasks: BackgroundTasks,
+        orchestrator: Annotated[BaseAsyncOrchestrator, Depends(get_async_orchestrator)],
         files: list[UploadFile],
         options: Annotated[
             ConvertDocumentsOptions, FormDepends(ConvertDocumentsOptions)
         ],
     ):
-        _log.info(f"Received {len(files)} files for processing.")
-
-        # Load the uploaded files to Docling DocumentStream
-        file_sources = []
-        for file in files:
-            buf = BytesIO(file.file.read())
-            name = file.filename if file.filename else "file.pdf"
-            file_sources.append(DocumentStream(name=name, stream=buf))
-
-        results = convert_documents(sources=file_sources, options=options)
-
-        response = process_results(
-            background_tasks=background_tasks,
-            conversion_options=options,
-            conv_results=results,
+        task = await _enque_file(
+            orchestrator=orchestrator, files=files, options=options
+        )
+        success = await _wait_task_complete(
+            orchestrator=orchestrator, task_id=task.task_id
         )
 
-        return response
+        if not success:
+            # TODO: abort task!
+            return HTTPException(
+                status_code=504, detail="Conversion is taking too long."
+            )
+
+        result = await orchestrator.task_result(
+            task_id=task.task_id, background_tasks=background_tasks
+        )
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Task result not found. Please wait for a completion status.",
+            )
+        return result
 
     # Convert a document from URL(s) using the async api
     @app.post(
@@ -316,7 +373,35 @@ def create_app():  # noqa: C901
         orchestrator: Annotated[BaseAsyncOrchestrator, Depends(get_async_orchestrator)],
         conversion_request: ConvertDocumentsRequest,
     ):
-        task = await orchestrator.enqueue(request=conversion_request)
+        task = await _enque_source(
+            orchestrator=orchestrator, conversion_request=conversion_request
+        )
+        task_queue_position = await orchestrator.get_queue_position(
+            task_id=task.task_id
+        )
+        return TaskStatusResponse(
+            task_id=task.task_id,
+            task_status=task.task_status,
+            task_position=task_queue_position,
+            task_meta=task.processing_meta,
+        )
+
+    # Convert a document from file(s) using the async api
+    @app.post(
+        "/v1alpha/convert/file/async",
+        response_model=TaskStatusResponse,
+    )
+    async def process_file_async(
+        orchestrator: Annotated[BaseAsyncOrchestrator, Depends(get_async_orchestrator)],
+        background_tasks: BackgroundTasks,
+        files: list[UploadFile],
+        options: Annotated[
+            ConvertDocumentsOptions, FormDepends(ConvertDocumentsOptions)
+        ],
+    ):
+        task = await _enque_file(
+            orchestrator=orchestrator, files=files, options=options
+        )
         task_queue_position = await orchestrator.get_queue_position(
             task_id=task.task_id
         )
@@ -426,9 +511,12 @@ def create_app():  # noqa: C901
     )
     async def task_result(
         orchestrator: Annotated[BaseAsyncOrchestrator, Depends(get_async_orchestrator)],
+        background_tasks: BackgroundTasks,
         task_id: str,
     ):
-        result = await orchestrator.task_result(task_id=task_id)
+        result = await orchestrator.task_result(
+            task_id=task_id, background_tasks=background_tasks
+        )
         if result is None:
             raise HTTPException(
                 status_code=404,
