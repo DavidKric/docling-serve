@@ -1,3 +1,14 @@
+## [v0.10.0](https://github.com/docling-project/docling-serve/releases/tag/v0.10.0) - 2025-04-28
+
+### Feature
+
+* Add support for file upload and return as file in async endpoints ([#152](https://github.com/docling-project/docling-serve/issues/152)) ([`c65f3c6`](https://github.com/docling-project/docling-serve/commit/c65f3c654c76c6b64b6aada1f0a153d74789d629))
+
+### Documentation
+
+* Fix new default pdf_backend ([#158](https://github.com/docling-project/docling-serve/issues/158)) ([`829effe`](https://github.com/docling-project/docling-serve/commit/829effec1a1b80320ccaf2c501be8015169b6fa3))
+* Fixing small typo in docs ([#155](https://github.com/docling-project/docling-serve/issues/155)) ([`14bafb2`](https://github.com/docling-project/docling-serve/commit/14bafb26286b94f80b56846c50d6e9a6d99a9763))
+
 ## [v0.9.0](https://github.com/docling-project/docling-serve/releases/tag/v0.9.0) - 2025-04-25
 
 ### Feature
