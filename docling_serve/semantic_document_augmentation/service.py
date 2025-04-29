@@ -1,23 +1,9 @@
 import re
-from docling.datamodel.document import DoclingDocument, DocItemLabel, BoundingBox
+from docling_core.types.doc import DoclingDocument, DocItemLabel, BoundingBox
 from typing import List, Dict
 from .schemas import Box,Span
-import uuid
 
 class SemanticDocumentAugmentationExportService:
-
-    # Store documents in memory for testing purposes
-    _document_store: dict[str, DoclingDocument] = {}
-
-    @classmethod
-    def register_document(cls, doc: DoclingDocument) -> str:
-        doc_id = str(uuid.uuid4())
-        cls._document_store[doc_id] = doc
-        return doc_id
-
-    @classmethod
-    def get_document(cls, doc_id: str) -> DoclingDocument | None:
-        return cls._document_store.get(doc_id)
 
     # Extract paragraphs from the document
     @staticmethod

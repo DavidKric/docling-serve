@@ -1,25 +1,172 @@
 # papermage_routes.py
-from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
-from typing import Annotated, Dict, Any, List
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, UploadFile, File, Form, Request
+from typing import Annotated, Dict, Any, List, Optional, Union, Callable, TypeVar
 import asyncio
 import logging
+import uuid
+from io import BytesIO
 
 from .schemas import ParagraphsResponse, SentencesResponse, TokensResponse, SectionsResponse, TitlesResponse, AuthorsResponse, TablesResponse, FiguresResponse, CaptionsResponse, FootnotesResponse, HeadersResponse, FootersResponse, ListsResponse, AlgorithmsResponse, EquationsResponse, ReferencesResponse, PapermageDocumentResponse
 from .service import SemanticDocumentAugmentationExportService
 from docling_serve.engines import get_orchestrator
 from docling_serve.engines.async_local.orchestrator import AsyncLocalOrchestrator
-from docling_serve.datamodel.responses import TaskStatusResponse, MessageKind, WebsocketMessage
+from docling_serve.datamodel.responses import TaskStatusResponse, MessageKind, WebsocketMessage, ConvertDocumentResponse
+from docling_serve.datamodel.convert import ConvertDocumentsOptions
+from docling_serve.datamodel.requests import ConvertDocumentsRequest, HttpSource, ConvertDocumentFileSourcesRequest
+from docling.datamodel.base_models import DocumentStream
+from docling_serve.docling_conversion import convert_documents
+from docling_serve.response_preparation import process_results
+from docling_serve.helper_functions import FormDepends
+from .middleware import DocumentStorageService
 
 _log = logging.getLogger(__name__)
 
-router = APIRouter(prefix="semantic-document-augmentation")
+router = APIRouter(prefix="", tags=["Semantic Document Augmentation"])
 
 # Helper function to fetch document with proper error handling
 async def _fetch_docling_document(document_id: str):
-    # Placeholder for document fetching
-    # In a real implementation, this would retrieve the document from storage
-    # and return None if not found
-    return None
+    """Get a document from the storage service by ID"""
+    doc = DocumentStorageService.get_document(document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return doc
+
+# Convert a document from URL(s)
+@router.post(
+    "/convert/source",
+    response_model=ConvertDocumentResponse,
+    responses={
+        200: {
+            "content": {"application/zip": {}},
+        }
+    },
+)
+def process_url(
+    background_tasks: BackgroundTasks, conversion_request: ConvertDocumentsRequest
+):
+    """
+    Convert documents from URLs or sources.
+    
+    The document registration will be handled automatically by middleware.
+    """
+    # Parse sources
+    sources: list[Union[str, DocumentStream]] = []
+    headers: Optional[dict[str, Any]] = None
+    if isinstance(conversion_request, ConvertDocumentFileSourcesRequest):
+        for file_source in conversion_request.file_sources:
+            sources.append(file_source.to_document_stream())
+    else:
+        for http_source in conversion_request.http_sources:
+            sources.append(http_source.url)
+            if headers is None and http_source.headers:
+                headers = http_source.headers
+
+    # Convert documents
+    results = convert_documents(
+        sources=sources, options=conversion_request.options, headers=headers
+    )
+
+    # Process results
+    response = process_results(
+        background_tasks=background_tasks,
+        conversion_options=conversion_request.options,
+        conv_results=results,
+    )
+    
+    return response
+
+# Convert a document from file(s)
+@router.post(
+    "/convert/file",
+    response_model=ConvertDocumentResponse,
+    responses={
+        200: {
+            "content": {"application/zip": {}},
+        }
+    },
+)
+async def process_file(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile],
+    options: Annotated[
+        ConvertDocumentsOptions, FormDepends(ConvertDocumentsOptions)
+    ],
+):
+    """
+    Convert uploaded documents.
+    
+    The document registration will be handled automatically by middleware.
+    """
+    _log.info(f"Received {len(files)} files for processing.")
+
+    # Load files
+    file_sources = []
+    for file in files:
+        buf = BytesIO(await file.read())
+        name = file.filename if file.filename else "file.pdf"
+        file_sources.append(DocumentStream(name=name, stream=buf))
+
+    # Convert documents
+    results = convert_documents(sources=file_sources, options=options)
+
+    # Process results
+    response = process_results(
+        background_tasks=background_tasks,
+        conversion_options=options,
+        conv_results=results,
+    )
+    
+    return response
+
+# Convert a document from URL(s) using the async api
+@router.post(
+    "/convert/source/async",
+    response_model=TaskStatusResponse,
+)
+async def process_url_async(
+    orchestrator: Annotated[AsyncLocalOrchestrator, Depends(get_orchestrator)],
+    conversion_request: ConvertDocumentsRequest,
+):
+    """
+    Asynchronously convert documents from URLs with task tracking.
+    
+    Document registration will be handled by middleware when results are retrieved.
+    """
+    task = await orchestrator.enqueue(request=conversion_request)
+    task_queue_position = await orchestrator.get_queue_position(
+        task_id=task.task_id
+    )
+    
+    return TaskStatusResponse(
+        task_id=task.task_id,
+        task_status=task.task_status,
+        task_position=task_queue_position,
+    )
+
+# Get result of async task
+@router.get(
+    "/result/{task_id}",
+    response_model=ConvertDocumentResponse,
+    responses={
+        200: {
+            "content": {"application/zip": {}},
+        }
+    },
+)
+async def task_result(
+    orchestrator: Annotated[AsyncLocalOrchestrator, Depends(get_orchestrator)],
+    task_id: str,
+):
+    """
+    Retrieve the result of an asynchronous conversion task.
+    
+    Document registration will be handled automatically by middleware.
+    """
+    try:
+        result = await orchestrator.get_result(task_id)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving task result: {str(e)}")
 
 @router.get("/paragraphs", response_model=ParagraphsResponse)
 async def get_paragraphs(document_id: str):
@@ -30,8 +177,6 @@ async def get_paragraphs(document_id: str):
     analogous to Papermage's text block segmentation (paragraphs).
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     para_entities = SemanticDocumentAugmentationExportService.extract_paragraphs(doc)
     return {"entities": para_entities}
 
@@ -64,8 +209,6 @@ async def get_sentences(document_id: str):
     is returned with its text and an approximate bounding box.
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     sentence_entities = SemanticDocumentAugmentationExportService.extract_sentences(doc)
     return {"entities": sentence_entities}
 
@@ -78,8 +221,6 @@ async def get_tokens(document_id: str):
     to Papermage's token layer, though precise coordinates may be approximated.
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     token_entities = SemanticDocumentAugmentationExportService.extract_tokens(doc)
     return {"entities": token_entities}
 
@@ -92,8 +233,6 @@ async def get_sections(document_id: str):
     analogous to Papermage's section entities.
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     section_entities = SemanticDocumentAugmentationExportService.extract_sections(doc)
     return {"entities": section_entities}
 
@@ -105,8 +244,6 @@ async def get_titles(document_id: str):
     Returns the title text of the document with its bounding box. In most cases, this is the main heading on the first page.
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     title_entities = SemanticDocumentAugmentationExportService.extract_title(doc)
     return {"entities": title_entities}
 
@@ -119,8 +256,6 @@ async def get_authors(document_id: str):
     Each author entry (or the whole author line) is returned with text and bounding box.
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     author_entities = SemanticDocumentAugmentationExportService.extract_authors(doc)
     return {"entities": author_entities}
 
@@ -136,8 +271,6 @@ async def get_tables(
     Each table is returned with a flattened text representation of its contents and its bounding box on the page.
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     
     # Initialize empty result
     table_entities = []
@@ -162,6 +295,9 @@ async def get_tables_async(
     Table extraction can be computationally expensive. This endpoint returns a task ID
     that can be used to poll for results.
     """
+    # Verify document exists first
+    await _fetch_docling_document(document_id)
+    
     task = await orchestrator.enqueue(
         request={"operation": "extract_tables", "document_id": document_id}
     )
@@ -194,8 +330,6 @@ async def get_figures(
     Each figure is represented by its bounding box. (No textual content is included for figures.)
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     
     # Initialize empty result
     figure_entities = []
@@ -220,6 +354,9 @@ async def get_figures_async(
     Figure extraction can be computationally expensive. This endpoint returns a task ID
     that can be used to poll for results.
     """
+    # Verify document exists first
+    await _fetch_docling_document(document_id)
+    
     task = await orchestrator.enqueue(
         request={"operation": "extract_figures", "document_id": document_id}
     )
@@ -248,8 +385,6 @@ async def get_captions(document_id: str):
     Each caption (figure or table description text) is returned with its text content and bounding box.
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     caption_entities = SemanticDocumentAugmentationExportService.extract_captions(doc)
     return {"entities": caption_entities}
 
@@ -261,8 +396,6 @@ async def get_footnotes(document_id: str):
     Each footnote is returned with its text content and bounding box (typically at the bottom of a page).
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     footnote_entities = SemanticDocumentAugmentationExportService.extract_footnotes(doc)
     return {"entities": footnote_entities}
 
@@ -274,8 +407,6 @@ async def get_headers(document_id: str):
     Each header (text at the top of a page, such as running titles or chapter names) is returned with text and bounding box.
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     header_entities = SemanticDocumentAugmentationExportService.extract_headers(doc)
     return {"entities": header_entities}
 
@@ -287,8 +418,6 @@ async def get_footers(document_id: str):
     Each footer (text at the bottom of a page, like page numbers or footnotes in the margin) is returned with text and bounding box.
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     footer_entities = SemanticDocumentAugmentationExportService.extract_footers(doc)
     return {"entities": footer_entities}
 
@@ -300,8 +429,6 @@ async def get_lists(document_id: str):
     Each list is returned as a single entity with the combined text of its items and a bounding box covering the list.
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     list_entities = SemanticDocumentAugmentationExportService.extract_lists(doc)
     return {"entities": list_entities}
 
@@ -313,8 +440,6 @@ async def get_algorithms(document_id: str):
     Each code block (monospaced algorithm listing) is returned with its full text and bounding box.
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     algo_entities = SemanticDocumentAugmentationExportService.extract_algorithms(doc)
     return {"entities": algo_entities}
 
@@ -326,8 +451,6 @@ async def get_equations(document_id: str):
     Each equation is returned as LaTeX/text form (if available) along with its bounding box.
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     equation_entities = SemanticDocumentAugmentationExportService.extract_equations(doc)
     return {"entities": equation_entities}
 
@@ -339,8 +462,6 @@ async def get_references(document_id: str):
     Each reference entry in the bibliography is returned with its text and bounding box.
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     reference_entities = SemanticDocumentAugmentationExportService.extract_references(doc)
     return {"entities": reference_entities}
 
@@ -357,8 +478,6 @@ async def export_papermage_style(
     of the document. Useful for applications that expect Papermage format data.
     """
     doc = await _fetch_docling_document(document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
     
     # Create empty response structure
     response = PapermageDocumentResponse(
@@ -400,6 +519,9 @@ async def export_papermage_style_async(
     Full document export is computationally intensive. This endpoint returns a task ID
     that can be used to poll for results or connect via WebSocket for progress updates.
     """
+    # Verify document exists first
+    await _fetch_docling_document(document_id)
+    
     task = await orchestrator.enqueue(
         request={"operation": "export_papermage", "document_id": document_id}
     )

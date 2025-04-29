@@ -6,7 +6,8 @@ import time
 from contextlib import asynccontextmanager
 from io import BytesIO
 from typing import Annotated
-from docling_serve.app import semantic_document_augmentation_router
+from docling_serve.semantic_document_augmentation import router as semantic_document_augmentation_router
+from docling_serve.semantic_document_augmentation.middleware import DocumentRegistrationMiddleware
 
 from fastapi import (
     BackgroundTasks,
@@ -144,7 +145,10 @@ def create_app():  # noqa: C901
         lifespan=lifespan,
         version=version,
     )
-    app.include_router(semantic_document_augmentation_router, prefix="/semantic-document-augmentation")
+    app.include_router(semantic_document_augmentation_router, 
+                       prefix="/semantic-document-augmentation",
+                       tags=["Semantic Document Augmentation"]
+                       )
     origins = docling_serve_settings.cors_origins
     methods = docling_serve_settings.cors_methods
     headers = docling_serve_settings.cors_headers
@@ -156,7 +160,11 @@ def create_app():  # noqa: C901
         allow_methods=methods,
         allow_headers=headers,
     )
-
+    
+    # Add the document registration middleware after CORS
+    # This will intercept and enhance responses from both original and new routes
+    app.add_middleware(DocumentRegistrationMiddleware)
+    
     # Mount the Gradio app
     if docling_serve_settings.enable_ui:
         try:
